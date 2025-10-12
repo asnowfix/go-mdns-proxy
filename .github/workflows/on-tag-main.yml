@@ -1,0 +1,32 @@
+name: On Tag Main
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+jobs:
+  trigger-packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get previous tag
+        id: previous_tag
+        run: |
+          # Get the second most recent tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -z "$PREVIOUS_TAG" ]; then
+            # If no previous tag, use the first commit
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "previous_tag=$PREVIOUS_TAG" | tee -a "$GITHUB_OUTPUT"
+      - name: Wait for tag to propagate
+        run: sleep 5
+      - name: Trigger Packaging Workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/package-release.yml/dispatches \
+            -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"ref\":\"${{ github.ref }}\",\"previous\":\"${{ steps.previous_tag.outputs.previous_tag }}\"}}"

@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# MSI build artifacts
+msi_build/
+*.msi
+wix.build.json

@@ -1,0 +1,121 @@
+name: Package and Release
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (tag or branch)'
+        required: true
+      previous:
+        description: 'Previous ref/tag'
+        required: true
+jobs:
+  package-msi:
+    runs-on: windows-latest
+    outputs:
+      release_version: ${{ steps.version.outputs.release }}
+      msi_file: ${{ steps.build-msi.outputs.msi_file }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref }}
+      - id: version
+        name: Get package version from ref
+        run: |
+          # Extract version from the ref input (e.g., refs/tags/v0.5.9 -> 0.5.9)
+          $ref = "${{ github.event.inputs.ref }}"
+          $tag = $ref -replace '^refs/tags/v*',''
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "release=$tag"
+          $version = $tag -split '\.'
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version_major=$($version[0])"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version_minor=$($version[1])"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version_patch=$($version[2])"
+      - id: install-go
+        name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.2
+      - id: build
+        name: Build Windows Executable
+        run: go build -o "mdns-proxy.exe" "."
+      - name: Install Windows SDK
+        id: install-windows-sdk
+        run: |
+          choco install windows-sdk-10.1 -y
+      - id: install-go-msi
+        name: Install go-msi
+        run: choco install go-msi
+      - id: wix-version
+        name: Set version in wix.json
+        run: |
+          $json = Get-Content .\wix.json | ConvertFrom-Json
+          $json.'version' = "${{ steps.version.outputs.release }}"
+          $json.'version-major' = ${{ steps.version.outputs.version_major }}
+          $json.'version-minor' = ${{ steps.version.outputs.version_minor }}
+          $json.'version-patch' = ${{ steps.version.outputs.version_patch }}
+          $json.upgrade.'version-max' = "${{ steps.version.outputs.release }}"
+          $json | ConvertTo-Json -Depth 10 | Set-Content .\wix.build.json
+      - id: build-msi
+        name: Build Windows Installer MSI from exe file
+        env:
+          Path: "C:\\Windows\\System32;$env:Path;C:\\Program Files\\go-msi;C:\\Program Files (x86)\\WiX Toolset v3.14\\bin;C:\\Program Files (x86)\\Wix Toolset v3.14"
+        run: |
+          $out = New-Item -Type Directory -Path . -Name "msi_build"
+          $msi = "MDNSProxy-${{ steps.version.outputs.release }}.msi"
+          go-msi make --msi "$out\$msi" --path .\wix.build.json --arch amd64 --license .\LICENSE --out $out --keep
+          Copy-Item "$out\$msi" -Destination "."
+          Get-Item $msi
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "msi_file=$msi"
+      - name: Upload MDNSProxy MSI as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi_file
+          path: |
+            ${{ steps.build-msi.outputs.msi_file }}
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - package-msi
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Get package version from ref
+        run: |
+          # Extract version from the ref input (e.g., refs/tags/v0.5.9 -> 0.5.9)
+          REF="${{ github.event.inputs.ref }}"
+          VERSION=$(echo "$REF" | sed -E 's|^refs/tags/v*(.*)$|\1|g')
+          echo "release=${VERSION}" | tee -a "$GITHUB_OUTPUT"
+      - name: Generate Release Notes
+        id: release_notes
+        uses: gableroux/generate-github-release-notes@v0.1.2
+        with:
+          repository: ${{ github.repository }}
+          base_tag: "${{ github.event.inputs.previous }}"
+          head_tag: ${{ github.ref }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download MDNSProxy MSI from package-msi
+        uses: actions/download-artifact@v4
+        with:
+          name: msi_file
+      - name: List files in workspace
+        id: list_files
+        run: ls -alR
+      - name: Release
+        id: release
+        uses: ncipollo/release-action@v1
+        with:
+          name: Release ${{ steps.version.outputs.release }}
+          artifactErrorsFailBuild: true
+          artifacts: "${{ needs.package-msi.outputs.msi_file }}"
+          tag: v${{ steps.version.outputs.release }}
+          prerelease: false
+          draft: true
+          replacesArtifacts: true
+          generateReleaseNotes: true

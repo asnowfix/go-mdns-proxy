@@ -1,0 +1,59 @@
+{
+  "product": "MDNSProxy",
+  "company": "AsNowFiX",
+  "license": "LICENSE",
+  "upgrade-code": "a1c2f4d6-8e9b-4c7a-9f1d-2e3b5c6d7e8f",
+  "version": "0.0.0",
+  "version-major": 0,
+  "version-minor": 0,
+  "version-patch": 0,
+  "upgrade": {
+    "version-min": "0.0.0",
+    "version-max": "0.0.0",
+    "remove-existing": true
+  },
+  "files": {
+    "guid": "b2d3e5f7-9a0c-5d8b-a2e4-3f4c6d7e8f9a",
+    "items": [
+      "mdns-proxy.exe"
+    ]
+  },
+  "env": {
+    "guid": "c3e4f6a8-0b1d-6e9c-b3f5-4a5d7e8f9a0b",
+    "vars": [
+      {
+        "name": "PATH",
+        "value": "c:\\Program Files\\MDNSProxy",
+        "permanent": "no",
+        "system": "no",
+        "action": "set",
+        "part": "last"
+      }
+    ]
+  },
+  "service": {
+    "guid": "d4f5a7b9-1c2e-7f0d-c4a6-5b6e8f9a0b1c",
+    "name": "MDNSProxy",
+    "display_name": "mDNS Proxy for WSL",
+    "description": "Bridges mDNS multicast traffic between WSL and physical network interfaces for service discovery",
+    "arguments": "",
+    "start_type": "auto",
+    "type": "shareprocess",
+    "service_host": "LocalService",
+    "error_control": "normal",
+    "interactive": false,
+    "delayed_start": false,
+    "dependencies": [
+      "Dnscache"
+    ]
+  },
+  "shortcuts": {
+    "guid": "e5a6b8c0-2d3f-8a1e-d5b7-6c7f9a0b1c2d",
+    "items": []
+  },
+  "choco": {
+    "description": "mDNS Proxy for WSL - Enables service discovery in WSL environments",
+    "tags": "mdns wsl proxy service-discovery avahi bonjour",
+    "license-url": "https://opensource.org/license/mpl-2-0"
+  }
+}
