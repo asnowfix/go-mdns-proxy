@@ -12,6 +12,8 @@ A Windows service that bridges mDNS (multicast DNS) traffic between the physical
 - [Usage](#usage)
   - [Manual Control](#manual-control)
 - [Building from Source](#building-from-source)
+- [Development \& Release Workflow](#development--release-workflow)
+  - [Release Process](#release-process)
 - [Testing](#testing)
   - [From WSL](#from-wsl)
   - [From Windows](#from-windows)
@@ -69,6 +71,23 @@ go build -o mdns-proxy.exe .
 # Run manually (for testing)
 .\mdns-proxy.exe
 ```
+
+## Development & Release Workflow
+
+### Release Process
+
+**Minor Release (v0.1.0):**
+1. Tag `v0.1.0` on `main` branch
+2. Workflow creates `v0.1.x` maintenance branch
+3. MSI package `MDNSProxy-0.1.0.msi` is built and released
+
+**Patch Release (v0.1.1):**
+1. Create PR targeting `v0.1.x` branch
+2. Merge PR
+3. Workflow auto-tags `v0.1.1`
+4. MSI package `MDNSProxy-0.1.1.msi` is built and released
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for detailed release instructions.
 
 ## Testing
 
