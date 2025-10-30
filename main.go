@@ -13,7 +13,9 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/jackpal/gateway"
 	"golang.org/x/net/ipv4"
@@ -21,11 +23,17 @@ import (
 )
 
 const (
-	mDNSPort     = 5353
-	bufferSize   = 65535
-	mDNSAddrIPv4 = "224.0.0.251"
-	mDNSAddrIPv6 = "ff02::fb"
+	mDNSPort             = 5353
+	bufferSize           = 65535
+	mDNSAddrIPv4         = "224.0.0.251"
+	mDNSAddrIPv6         = "ff02::fb"
+	defaultStatsInterval = 5 * time.Second
 )
+
+type trafficStats struct {
+	packets atomic.Uint64
+	bytes   atomic.Uint64
+}
 
 type Bridge struct {
 	wslInterface  *net.Interface
@@ -33,18 +41,23 @@ type Bridge struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
-	
+	statsInterval time.Duration
+
 	// IPv4 connections - separate socket per interface
 	wslIPv4Conn  *ipv4.PacketConn
 	wslIPv4UDP   *net.UDPConn
 	hostIPv4Conn *ipv4.PacketConn
 	hostIPv4UDP  *net.UDPConn
-	
+
 	// IPv6 connections - separate socket per interface
 	wslIPv6Conn  *ipv6.PacketConn
 	wslIPv6UDP   *net.UDPConn
 	hostIPv6Conn *ipv6.PacketConn
 	hostIPv6UDP  *net.UDPConn
+
+	// Traffic statistics
+	wslToHost trafficStats
+	hostToWSL trafficStats
 }
 
 func findWSLInterface() (string, error) {
@@ -53,12 +66,28 @@ func findWSLInterface() (string, error) {
 		return "", fmt.Errorf("failed to list network interfaces: %v", err)
 	}
 
+	var fallback string
 	for _, iface := range interfaces {
 		name := strings.ToLower(iface.Name)
-		// WSL interfaces typically have "wsl" in their name
-		if strings.Contains(name, "wsl") || strings.Contains(name, "vethernet") {
-			return iface.Name, nil
+		// Prefer interfaces with "wsl" explicitly in the name
+		if strings.Contains(name, "wsl") {
+			// Prefer "WSL (Hyper-V firewall)" over "Default Switch"
+			if !strings.Contains(name, "default switch") {
+				return iface.Name, nil
+			}
+			// Keep Default Switch as fallback
+			if fallback == "" {
+				fallback = iface.Name
+			}
 		}
+		// Also consider vEthernet as fallback
+		if fallback == "" && strings.Contains(name, "vethernet") {
+			fallback = iface.Name
+		}
+	}
+
+	if fallback != "" {
+		return fallback, nil
 	}
 
 	return "", fmt.Errorf("no WSL interface found")
@@ -118,6 +147,7 @@ func NewBridge(wslInterfaceName, hostInterfaceName string) (*Bridge, error) {
 		hostInterface: hostIface,
 		ctx:           ctx,
 		cancel:        cancel,
+		statsInterval: defaultStatsInterval,
 	}, nil
 }
 
@@ -136,48 +166,48 @@ func (b *Bridge) setupIPv4Socket(iface *net.Interface) (*ipv4.PacketConn, *net.U
 			return sockOptErr
 		},
 	}
-	
+
 	// Bind to 0.0.0.0:5353 to receive multicast packets
 	addr := &net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: mDNSPort,
 	}
-	
+
 	// Listen with the configured socket options
 	packetConn, err := lc.ListenPacket(context.Background(), "udp4", addr.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create IPv4 socket: %v", err)
 	}
-	
+
 	conn := packetConn.(*net.UDPConn)
-	
+
 	// Set socket options
 	if err := conn.SetReadBuffer(bufferSize); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("failed to set read buffer: %v", err)
 	}
-	
+
 	// Create packet conn for multicast control
 	p := ipv4.NewPacketConn(conn)
-	
+
 	// Join multicast group on this interface
 	mcastAddr := &net.UDPAddr{IP: net.ParseIP(mDNSAddrIPv4)}
-	
+
 	if err := p.JoinGroup(iface, mcastAddr); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("failed to join multicast group: %v", err)
 	}
-	
+
 	// Enable multicast loopback - CRITICAL for bridge to work
 	if err := p.SetMulticastLoopback(true); err != nil {
 		log.Printf("Warning: failed to enable multicast loopback: %v", err)
 	}
-	
+
 	// Set multicast TTL
 	if err := p.SetMulticastTTL(255); err != nil {
 		log.Printf("Warning: failed to set multicast TTL: %v", err)
 	}
-	
+
 	return p, conn, nil
 }
 
@@ -190,7 +220,7 @@ func (b *Bridge) setupIPv4() error {
 	b.wslIPv4Conn = wslConn
 	b.wslIPv4UDP = wslUDP
 	log.Printf("Joined IPv4 multicast group on %s", b.wslInterface.Name)
-	
+
 	// Create socket for host interface
 	hostConn, hostUDP, err := b.setupIPv4Socket(b.hostInterface)
 	if err != nil {
@@ -200,7 +230,7 @@ func (b *Bridge) setupIPv4() error {
 	b.hostIPv4Conn = hostConn
 	b.hostIPv4UDP = hostUDP
 	log.Printf("Joined IPv4 multicast group on %s", b.hostInterface.Name)
-	
+
 	return nil
 }
 
@@ -219,48 +249,48 @@ func (b *Bridge) setupIPv6Socket(iface *net.Interface) (*ipv6.PacketConn, *net.U
 			return sockOptErr
 		},
 	}
-	
+
 	// Bind to [::]:5353 to receive multicast packets
 	addr := &net.UDPAddr{
 		IP:   net.IPv6zero,
 		Port: mDNSPort,
 	}
-	
+
 	// Listen with the configured socket options
 	packetConn, err := lc.ListenPacket(context.Background(), "udp6", addr.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create IPv6 socket: %v", err)
 	}
-	
+
 	conn := packetConn.(*net.UDPConn)
-	
+
 	// Set socket options
 	if err := conn.SetReadBuffer(bufferSize); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("failed to set read buffer: %v", err)
 	}
-	
+
 	// Create packet conn for multicast control
 	p := ipv6.NewPacketConn(conn)
-	
+
 	// Join multicast group on this interface
 	mcastAddr := &net.UDPAddr{IP: net.ParseIP(mDNSAddrIPv6)}
-	
+
 	if err := p.JoinGroup(iface, mcastAddr); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("failed to join multicast group: %v", err)
 	}
-	
+
 	// Enable multicast loopback - CRITICAL for bridge to work
 	if err := p.SetMulticastLoopback(true); err != nil {
 		log.Printf("Warning: failed to enable multicast loopback: %v", err)
 	}
-	
+
 	// Set multicast hop limit
 	if err := p.SetMulticastHopLimit(255); err != nil {
 		log.Printf("Warning: failed to set multicast hop limit: %v", err)
 	}
-	
+
 	return p, conn, nil
 }
 
@@ -273,7 +303,7 @@ func (b *Bridge) setupIPv6() error {
 	b.wslIPv6Conn = wslConn
 	b.wslIPv6UDP = wslUDP
 	log.Printf("Joined IPv6 multicast group on %s", b.wslInterface.Name)
-	
+
 	// Create socket for host interface
 	hostConn, hostUDP, err := b.setupIPv6Socket(b.hostInterface)
 	if err != nil {
@@ -283,11 +313,11 @@ func (b *Bridge) setupIPv6() error {
 	b.hostIPv6Conn = hostConn
 	b.hostIPv6UDP = hostUDP
 	log.Printf("Joined IPv6 multicast group on %s", b.hostInterface.Name)
-	
+
 	return nil
 }
 
-func (b *Bridge) forwardIPv4Packets(srcConn *ipv4.PacketConn, dstConn *ipv4.PacketConn, srcName, dstName string) {
+func (b *Bridge) forwardIPv4Packets(srcConn *ipv4.PacketConn, dstConn *ipv4.PacketConn, srcName, dstName string, stats *trafficStats) {
 	defer b.wg.Done()
 	buffer := make([]byte, bufferSize)
 	mcastAddr := &net.UDPAddr{
@@ -301,7 +331,7 @@ func (b *Bridge) forwardIPv4Packets(srcConn *ipv4.PacketConn, dstConn *ipv4.Pack
 			return
 		default:
 			// Read packet from source interface
-			n, _, srcAddr, err := srcConn.ReadFrom(buffer)
+			n, _, _, err := srcConn.ReadFrom(buffer)
 			if err != nil {
 				if b.ctx.Err() != nil {
 					return
@@ -313,18 +343,19 @@ func (b *Bridge) forwardIPv4Packets(srcConn *ipv4.PacketConn, dstConn *ipv4.Pack
 			// Forward to destination interface's multicast group
 			_, err = dstConn.WriteTo(buffer[:n], nil, mcastAddr)
 			if err != nil {
-				log.Printf("Error forwarding IPv4 packet from %s to %s: %v", 
+				log.Printf("Error forwarding IPv4 packet from %s to %s: %v",
 					srcName, dstName, err)
 				continue
 			}
 
-			log.Printf("Forwarded %d bytes IPv4: %s -> %s (from %s)", 
-				n, srcName, dstName, srcAddr)
+			// Update statistics
+			stats.packets.Add(1)
+			stats.bytes.Add(uint64(n))
 		}
 	}
 }
 
-func (b *Bridge) forwardIPv6Packets(srcConn *ipv6.PacketConn, dstConn *ipv6.PacketConn, srcName, dstName string) {
+func (b *Bridge) forwardIPv6Packets(srcConn *ipv6.PacketConn, dstConn *ipv6.PacketConn, srcName, dstName string, stats *trafficStats) {
 	defer b.wg.Done()
 	buffer := make([]byte, bufferSize)
 	mcastAddr := &net.UDPAddr{
@@ -338,7 +369,7 @@ func (b *Bridge) forwardIPv6Packets(srcConn *ipv6.PacketConn, dstConn *ipv6.Pack
 			return
 		default:
 			// Read packet from source interface
-			n, _, srcAddr, err := srcConn.ReadFrom(buffer)
+			n, _, _, err := srcConn.ReadFrom(buffer)
 			if err != nil {
 				if b.ctx.Err() != nil {
 					return
@@ -350,21 +381,22 @@ func (b *Bridge) forwardIPv6Packets(srcConn *ipv6.PacketConn, dstConn *ipv6.Pack
 			// Forward to destination interface's multicast group
 			_, err = dstConn.WriteTo(buffer[:n], nil, mcastAddr)
 			if err != nil {
-				log.Printf("Error forwarding IPv6 packet from %s to %s: %v", 
+				log.Printf("Error forwarding IPv6 packet from %s to %s: %v",
 					srcName, dstName, err)
 				continue
 			}
 
-			log.Printf("Forwarded %d bytes IPv6: %s -> %s (from %s)", 
-				n, srcName, dstName, srcAddr)
+			// Update statistics
+			stats.packets.Add(1)
+			stats.bytes.Add(uint64(n))
 		}
 	}
 }
 
 func (b *Bridge) Start() error {
-	log.Printf("Setting up mDNS bridge between %s and %s", 
+	log.Printf("Setting up mDNS bridge between %s and %s",
 		b.wslInterface.Name, b.hostInterface.Name)
-	
+
 	// Set up IPv4
 	if err := b.setupIPv4(); err != nil {
 		return fmt.Errorf("failed to set up IPv4: %v", err)
@@ -380,26 +412,54 @@ func (b *Bridge) Start() error {
 
 	// Start forwarding goroutines for IPv4 (bidirectional)
 	b.wg.Add(2)
-	go b.forwardIPv4Packets(b.wslIPv4Conn, b.hostIPv4Conn, b.wslInterface.Name, b.hostInterface.Name)
-	go b.forwardIPv4Packets(b.hostIPv4Conn, b.wslIPv4Conn, b.hostInterface.Name, b.wslInterface.Name)
+	go b.forwardIPv4Packets(b.wslIPv4Conn, b.hostIPv4Conn, b.wslInterface.Name, b.hostInterface.Name, &b.wslToHost)
+	go b.forwardIPv4Packets(b.hostIPv4Conn, b.wslIPv4Conn, b.hostInterface.Name, b.wslInterface.Name, &b.hostToWSL)
 	log.Printf("Started IPv4 packet forwarding")
 
 	// Start forwarding goroutines for IPv6 (bidirectional) if available
 	if b.wslIPv6Conn != nil && b.hostIPv6Conn != nil {
 		b.wg.Add(2)
-		go b.forwardIPv6Packets(b.wslIPv6Conn, b.hostIPv6Conn, b.wslInterface.Name, b.hostInterface.Name)
-		go b.forwardIPv6Packets(b.hostIPv6Conn, b.wslIPv6Conn, b.hostInterface.Name, b.wslInterface.Name)
+		go b.forwardIPv6Packets(b.wslIPv6Conn, b.hostIPv6Conn, b.wslInterface.Name, b.hostInterface.Name, &b.wslToHost)
+		go b.forwardIPv6Packets(b.hostIPv6Conn, b.wslIPv6Conn, b.hostInterface.Name, b.wslInterface.Name, &b.hostToWSL)
 		log.Printf("Started IPv6 packet forwarding")
 	}
+
+	// Start statistics reporter
+	b.wg.Add(1)
+	go b.reportStats()
 
 	log.Printf("mDNS bridge is running")
 	return nil
 }
 
+func (b *Bridge) reportStats() {
+	defer b.wg.Done()
+	ticker := time.NewTicker(b.statsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			wslToHostPkts := b.wslToHost.packets.Swap(0)
+			wslToHostBytes := b.wslToHost.bytes.Swap(0)
+			hostToWSLPkts := b.hostToWSL.packets.Swap(0)
+			hostToWSLBytes := b.hostToWSL.bytes.Swap(0)
+
+			if wslToHostPkts > 0 || hostToWSLPkts > 0 {
+				log.Printf("Traffic: %s->%s: %d pkts (%d bytes) | %s->%s: %d pkts (%d bytes)",
+					b.wslInterface.Name, b.hostInterface.Name, wslToHostPkts, wslToHostBytes,
+					b.hostInterface.Name, b.wslInterface.Name, hostToWSLPkts, hostToWSLBytes)
+			}
+		}
+	}
+}
+
 func (b *Bridge) Stop() {
 	log.Printf("Stopping mDNS bridge...")
 	b.cancel()
-	
+
 	// Close connections to unblock ReadFrom calls
 	if b.wslIPv4UDP != nil {
 		b.wslIPv4UDP.Close()
@@ -413,7 +473,7 @@ func (b *Bridge) Stop() {
 	if b.hostIPv6UDP != nil {
 		b.hostIPv6UDP.Close()
 	}
-	
+
 	b.wg.Wait()
 	log.Printf("mDNS bridge stopped")
 }
@@ -421,6 +481,7 @@ func (b *Bridge) Stop() {
 func main() {
 	wslIface := flag.String("wsl", "", "WSL interface name (optional, will auto-detect if not provided)")
 	hostIface := flag.String("host", "", "Host interface name (optional, will use default route interface if not provided)")
+	statsInterval := flag.Duration("stats-interval", defaultStatsInterval, "Traffic statistics reporting interval (0 to disable)")
 	flag.Parse()
 
 	// Auto-detect WSL interface if not provided
@@ -448,6 +509,11 @@ func main() {
 	bridge, err := NewBridge(wslIfaceName, hostIfaceName)
 	if err != nil {
 		log.Fatalf("Failed to create bridge: %v", err)
+	}
+
+	// Set custom stats interval if provided
+	if *statsInterval > 0 {
+		bridge.statsInterval = *statsInterval
 	}
 
 	sigChan := make(chan os.Signal, 1)
